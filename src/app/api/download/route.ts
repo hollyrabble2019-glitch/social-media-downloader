@@ -1,0 +1,116 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { Downloader } from '../../../lib/downloader'
+import { validateUrl, detectPlatform } from '../../../lib/validator'
+
+export async function POST(request: NextRequest) {
+  try {
+    const { url, type = 'video' } = await request.json()
+
+    if (!url) {
+      return NextResponse.json(
+        { success: false, error: 'URL is required' },
+        { status: 400 },
+      )
+    }
+
+    if (!validateUrl(url)) {
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            'Invalid URL. Please paste a TikTok, Twitter/X, Instagram, Facebook, or YouTube link.',
+        },
+        { status: 400 },
+      )
+    }
+
+    const platform = detectPlatform(url)
+    console.log(`Processing ${platform} URL:`, url, 'Type:', type)
+
+    const downloader = new Downloader()
+    const videoData = await downloader.downloadVideo(url)
+
+    // Accept the result if it yielded any downloadable media: a video stream,
+    // a flagged photo carousel (TikTok), or a plain image set (Instagram posts).
+    // Also accept an embed-only result (YouTube fallback: playable but not
+    // downloadable).
+    const hasImages = (videoData?.images?.length ?? 0) > 0
+    if (
+      !videoData ||
+      (!videoData.downloadUrl &&
+        !videoData.isPhotoCarousel &&
+        !hasImages &&
+        !videoData.embedUrl)
+    ) {
+      return NextResponse.json(
+        { success: false, error: 'Failed to extract download URL' },
+        { status: 500 },
+      )
+    }
+
+    // Same-origin API paths (e.g. the yt-dlp streaming endpoint
+    // /api/youtube?...) are already playable as-is — only external media URLs
+    // need wrapping in the proxy routes.
+    const toMediaUrl = (mediaUrl: string, proxyPath: string) =>
+      mediaUrl.startsWith('/')
+        ? mediaUrl
+        : `${proxyPath}?url=${encodeURIComponent(mediaUrl)}`
+
+    // Video proxy: forces video/mp4 content-type so browsers render a proper video player.
+    // Audio proxy: re-serves the video stream OR slideshow music as audio/mpeg.
+    const videoProxyUrl = videoData.downloadUrl
+      ? toMediaUrl(videoData.downloadUrl, '/api/video')
+      : undefined
+
+    // Prefer the dedicated music track (photo carousels / some videos) — falls back to
+    // re-serving the video stream as audio when no separate track is available.
+    const audioSourceUrl = videoData.musicUrl || videoData.downloadUrl
+    const audioProxyUrl = audioSourceUrl
+      ? toMediaUrl(audioSourceUrl, '/api/audio')
+      : undefined
+
+    // Instagram's CDN blocks cross-origin <img>/fetch from the browser (it only
+    // serves to instagram.com), so image URLs must be routed through our
+    // same-origin /api/image proxy for both display and download. TikTok/Twitter
+    // images load directly, so they are left untouched.
+    const isInstagram = platform === 'instagram'
+    const proxyImage = (u: string) =>
+      isInstagram && u ? `/api/image?url=${encodeURIComponent(u)}` : u
+
+    return NextResponse.json({
+      success: true,
+      downloadUrl: videoProxyUrl,
+      audioUrl: audioProxyUrl,
+      metadata: {
+        title: videoData.title,
+        author: videoData.author,
+        duration: videoData.duration,
+        thumbnail: proxyImage(videoData.thumbnail),
+        platform,
+        isPhotoCarousel: videoData.isPhotoCarousel ?? false,
+        embedUrl: videoData.embedUrl,
+        musicTitle: videoData.musicTitle,
+        musicAuthor: videoData.musicAuthor,
+        // Raw (non-proxied) URLs needed by the /api/slideshow renderer
+        rawMusicUrl: videoData.musicUrl,
+        images:
+          videoData.images?.map((img) => ({
+            ...img,
+            url: proxyImage(img.url),
+            thumbnail: proxyImage(img.thumbnail),
+            selected: false,
+          })) || [],
+      },
+    })
+  } catch (error) {
+    console.error('Download error:', error)
+    return NextResponse.json(
+      {
+        success: false,
+        error:
+          error instanceof Error ? error.message : 'Failed to process video',
+      },
+      { status: 500 },
+    )
+  }
+}
